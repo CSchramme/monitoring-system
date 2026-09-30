@@ -28,6 +28,7 @@ Push-Signal länger als *Intervall + Karenzzeit* aus, gibt es Alarm, wie bei ein
 ## Schnellstart
 
 ```bash
+cp .env.example .env      # Zugangsdaten eintragen (v. a. MONITOR_USER_DB_PASSWORD)
 docker compose up -d
 ```
 
@@ -58,7 +59,33 @@ Voraussetzung ist Python 3.11 oder neuer. Für Ping-Prüfungen muss `ping` insta
 | `MONITOR_RETENTION_DAYS` | `30` | Wie lange Messwerte aufbewahrt werden. Statuswechsel bleiben mindestens 90 Tage. |
 | `MONITOR_SESSION_DAYS` | `30` | Gültigkeit einer Anmeldung |
 | `MONITOR_MAX_CONCURRENT_CHECKS` | `50` | Maximal gleichzeitig laufende Prüfungen |
+| `MONITOR_USER_DB_HOST` | leer | MariaDB/MySQL-Host für die Benutzerverwaltung. Leer = Benutzer in der lokalen SQLite-Datei |
+| `MONITOR_USER_DB_PORT` | `3306` | Port der Benutzer-Datenbank |
+| `MONITOR_USER_DB_NAME` / `_USER` / `_PASSWORD` | leer | Datenbankname und Zugangsdaten |
+| `MONITOR_USER_DB_TABLE` | `users` | Tabelle mit den Benutzerkonten |
 | `FORWARDED_ALLOW_IPS` | `127.0.0.1` | IP(s) des Reverse Proxys, dessen `X-Forwarded-For` vertraut wird (wichtig für die Login-Sperre nach Fehlversuchen) |
+
+## Gemeinsame Benutzer-Datenbank (MariaDB, z. B. aus Plesk)
+
+Die Benutzerkonten können in einer externen MariaDB liegen und dort auch von anderen Anwendungen
+genutzt werden. Die Messdaten bleiben in der lokalen SQLite-Datei.
+
+- **Benutzertabelle** (`MONITOR_USER_DB_TABLE`, Standard `users`): Benötigt werden nur die Spalten
+  `id`, `username` und `password_hash`. Weitere Spalten sind erlaubt. Existiert die Tabelle
+  noch nicht, wird sie angelegt. Existiert sie ohne diese Spalten, bricht der Start mit einer
+  klaren Meldung ab.
+- **Passwörter** werden als bcrypt im PHP-Format (`$2y$…`) gespeichert. PHP-Anwendungen können sie
+  also direkt mit `password_verify()` prüfen, und Hashes aus `password_hash()` funktionieren hier
+  umgekehrt genauso.
+- **Sitzungen und API-Keys** landen in eigenen Tabellen `monitor_sessions` und `monitor_api_keys`.
+- Enthält die Tabelle bereits Benutzer, entfällt die Ersteinrichtung und man meldet sich mit einem
+  vorhandenen Konto an.
+- Ist die Datenbank nicht erreichbar, liefern Login und Oberfläche einen Fehler (503).
+  Prüfungen und Alarme laufen trotzdem weiter.
+
+**Plesk mit Docker:** Die MariaDB von Plesk lauscht normalerweise nur auf `127.0.0.1`. Deshalb nutzt
+die `docker-compose.yml` das Host-Netzwerk (`network_mode: host`) und `MONITOR_USER_DB_HOST=127.0.0.1`.
+Die Oberfläche ist dann direkt auf Port 8080 des Servers erreichbar.
 
 ## Push-Schnittstelle
 
@@ -150,6 +177,8 @@ scrape_configs:
 ```bash
 pip install -r requirements-dev.txt
 pytest
+# zusätzlich gegen eine Wegwerf-MariaDB:
+MONITOR_TEST_MARIADB="127.0.0.1:3306:user:passwort:datenbank" pytest tests/test_mariadb.py
 ```
 
 Aufbau:
@@ -163,6 +192,7 @@ app/
   service.py     Statuslogik (Wiederholungen, Statuswechsel), Auswertungen
   notifier.py    Benachrichtigungskanäle
   auth.py        Passwörter, Sitzungen, API-Keys
+  userstore.py   Benutzer-Speicher: SQLite oder MariaDB
   db.py          SQLite-Schema und Zugriff
   static/        Weboberfläche (ohne Build-Schritt, keine externen Abhängigkeiten)
 agent/           Agent-Skripte für Linux und Windows

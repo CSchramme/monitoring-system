@@ -158,5 +158,4 @@ def purge_old_results(db: Database, retention_days: int, now: float | None = Non
     cutoff = now - retention_days * 86400
     deleted = db.execute("DELETE FROM results WHERE ts < ?", (cutoff,)).rowcount
     db.execute("DELETE FROM events WHERE ts < ?", (now - max(retention_days, 90) * 86400,))
-    db.execute("DELETE FROM sessions WHERE expires_at < ?", (now,))
     return deleted

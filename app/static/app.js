@@ -457,7 +457,7 @@ function renderLogin() {
 function renderSetup() {
   authScreen("Ersteinrichtung", "Lege das Administrator-Konto für dein Monitoring an.", [
     textField("Benutzername", { name: "username", type: "text", autocomplete: "username", required: true, value: "admin" }),
-    textField("Passwort", { name: "password", type: "password", autocomplete: "new-password", required: true, minlength: 8 }, "Mindestens 8 Zeichen"),
+    textField("Passwort", { name: "password", type: "password", autocomplete: "new-password", required: true, minlength: 8 }, "Mindestens 8, höchstens 72 Zeichen"),
     textField("Passwort wiederholen", { name: "password2", type: "password", autocomplete: "new-password", required: true }),
   ], "Konto anlegen", (data) => {
     if (data.get("password") !== data.get("password2")) throw new Error("Die Passwörter stimmen nicht überein");
@@ -1644,6 +1644,7 @@ async function viewSettings(main) {
     card("System", null,
       h("table", { class: "data" }, h("tbody", null,
         h("tr", null, h("th", null, "Version"), h("td", null, state.auth.version)),
+        h("tr", null, h("th", null, "Benutzer-Datenbank"), h("td", null, state.auth.user_db)),
         h("tr", null, h("th", null, "Datenaufbewahrung"), h("td", null, `${state.auth.retention_days} Tage (MONITOR_RETENTION_DAYS)`)),
         h("tr", null, h("th", null, "Öffentliche URL"), h("td", null, state.auth.public_url || h("span", { class: "muted" }, "nicht gesetzt – MONITOR_PUBLIC_URL setzen, damit Links in Benachrichtigungen funktionieren"))),
       ))));

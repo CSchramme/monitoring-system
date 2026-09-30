@@ -26,6 +26,21 @@ class Settings:
     secure_cookies: bool = field(default_factory=lambda: _bool("MONITOR_SECURE_COOKIES", False))
     session_days: int = field(default_factory=lambda: int(os.environ.get("MONITOR_SESSION_DAYS", "30")))
 
+    # Optional external MariaDB/MySQL database for user accounts (shared with other applications).
+    # If MONITOR_USER_DB_HOST is empty, users are stored in the local SQLite database.
+    user_db_host: str = field(default_factory=lambda: os.environ.get("MONITOR_USER_DB_HOST", ""))
+    user_db_port: int = field(default_factory=lambda: int(os.environ.get("MONITOR_USER_DB_PORT", "3306")))
+    user_db_name: str = field(default_factory=lambda: os.environ.get("MONITOR_USER_DB_NAME", ""))
+    user_db_user: str = field(default_factory=lambda: os.environ.get("MONITOR_USER_DB_USER", ""))
+    user_db_password: str = field(default_factory=lambda: os.environ.get("MONITOR_USER_DB_PASSWORD", ""), repr=False)
+    user_db_table: str = field(default_factory=lambda: os.environ.get("MONITOR_USER_DB_TABLE", "users"))
+
+    @property
+    def user_db_label(self) -> str:
+        if not self.user_db_host:
+            return "SQLite (lokal)"
+        return f"MariaDB {self.user_db_host}:{self.user_db_port}/{self.user_db_name} (Tabelle {self.user_db_table})"
+
     @property
     def db_path(self) -> Path:
         return self.data_dir / "monitor.db"

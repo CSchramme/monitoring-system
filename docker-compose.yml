@@ -3,14 +3,11 @@ services:
     build: .
     container_name: monitoring
     restart: unless-stopped
-    ports:
-      - "8080:8080"
-    environment:
-      # Externe Adresse der Oberfläche (für Links in Benachrichtigungen und die Anbindungs-Beispiele)
-      MONITOR_PUBLIC_URL: "http://localhost:8080"
-      # Auf "true" setzen, sobald die Oberfläche über HTTPS erreichbar ist
-      MONITOR_SECURE_COOKIES: "false"
-      MONITOR_RETENTION_DAYS: "30"
+    # Host-Netzwerk, damit der Container die MariaDB von Plesk unter 127.0.0.1:3306 erreicht
+    # (Plesk-MariaDB lauscht meist nur lokal). Die Oberfläche ist dann direkt auf Port 8080 des Servers.
+    network_mode: host
+    # Zugangsdaten und Einstellungen: .env.example nach .env kopieren und ausfüllen
+    env_file: .env
     volumes:
       - monitoring-data:/data
 

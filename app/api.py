@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from . import __version__
 from .auth import (
+    MAX_PASSWORD_BYTES,
     SESSION_COOKIE,
     authenticate,
     create_api_key,
@@ -34,6 +35,7 @@ from .checks import (
 )
 from .db import Database
 from .notifier import CHANNEL_REQUIRED
+from .userstore import UserStore
 from .service import bucket_results, recent_beats, record_result, uptime_by_monitor
 
 router = APIRouter(prefix="/api")
@@ -275,9 +277,18 @@ def health() -> dict[str, Any]:
     return {"status": "ok", "version": __version__}
 
 
+def get_users(request: Request) -> UserStore:
+    return request.app.state.users
+
+
+def _check_password_length(password: str) -> None:
+    if len(password.encode()) > MAX_PASSWORD_BYTES:
+        raise _bad(f"Passwort darf höchstens {MAX_PASSWORD_BYTES} Bytes lang sein")
+
+
 @router.get("/auth/status")
-def auth_status(request: Request, db: Database = Depends(get_db)) -> dict[str, Any]:
-    setup_required = db.scalar("SELECT COUNT(*) FROM users") == 0
+def auth_status(request: Request, users: UserStore = Depends(get_users)) -> dict[str, Any]:
+    setup_required = users.count_users() == 0
     user = None
     try:
         principal = authenticate(request)
@@ -290,56 +301,55 @@ def auth_status(request: Request, db: Database = Depends(get_db)) -> dict[str, A
         "user": user,
         "public_url": settings.public_url,
         "retention_days": settings.retention_days,
+        "user_db": settings.user_db_label,
         "version": __version__,
     }
 
 
 @router.post("/auth/setup")
-def setup(body: SetupIn, request: Request, response: Response, db: Database = Depends(get_db)) -> dict[str, Any]:
-    with db.transaction():
-        if db.scalar("SELECT COUNT(*) FROM users") > 0:
-            raise HTTPException(409, "Einrichtung wurde bereits abgeschlossen")
-        user_id = db.execute(
-            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
-            (body.username.strip(), hash_password(body.password), time.time()),
-        ).lastrowid
-    _set_session_cookie(request, response, create_session(db, user_id, request.app.state.settings.session_days))
+def setup(body: SetupIn, request: Request, response: Response, users: UserStore = Depends(get_users)) -> dict[str, Any]:
+    _check_password_length(body.password)
+    user_id = users.create_first_user(body.username.strip(), hash_password(body.password))
+    if user_id is None:
+        raise HTTPException(409, "Einrichtung wurde bereits abgeschlossen")
+    _set_session_cookie(request, response, create_session(users, user_id, request.app.state.settings.session_days))
     return {"ok": True}
 
 
 @router.post("/auth/login")
-def login(body: Credentials, request: Request, response: Response, db: Database = Depends(get_db)) -> dict[str, Any]:
+def login(body: Credentials, request: Request, response: Response, users: UserStore = Depends(get_users)) -> dict[str, Any]:
     throttle = request.app.state.throttle
     key = _client_key(request)
     throttle.check(key)
-    user = db.one("SELECT * FROM users WHERE username = ?", (body.username.strip(),))
+    user = users.get_user_by_name(body.username.strip())
     if user is None or not verify_password(body.password, user["password_hash"]):
         throttle.fail(key)
         raise HTTPException(401, "Benutzername oder Passwort falsch")
     throttle.reset(key)
-    _set_session_cookie(request, response, create_session(db, user["id"], request.app.state.settings.session_days))
+    _set_session_cookie(request, response, create_session(users, user["id"], request.app.state.settings.session_days))
     return {"ok": True}
 
 
 @router.post("/auth/logout")
-def logout(request: Request, response: Response, db: Database = Depends(get_db)) -> dict[str, Any]:
+def logout(request: Request, response: Response, users: UserStore = Depends(get_users)) -> dict[str, Any]:
     token = request.cookies.get(SESSION_COOKIE)
     if token:
-        delete_session(db, token)
+        delete_session(users, token)
     response.delete_cookie(SESSION_COOKIE, path="/")
     return {"ok": True}
 
 
 @protected.post("/auth/password")
 def change_password(
-    body: PasswordChange, principal: dict = Depends(authenticate), db: Database = Depends(get_db)
+    body: PasswordChange, principal: dict = Depends(authenticate), users: UserStore = Depends(get_users)
 ) -> dict[str, Any]:
     if principal["kind"] != "user":
         raise HTTPException(403, "Nur für angemeldete Benutzer")
-    user = db.one("SELECT * FROM users WHERE id = ?", (principal["id"],))
+    _check_password_length(body.new_password)
+    user = users.get_user(principal["id"])
     if not user or not verify_password(body.current_password, user["password_hash"]):
         raise HTTPException(400, "Aktuelles Passwort ist falsch")
-    db.execute("UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(body.new_password), user["id"]))
+    users.set_password(user["id"], hash_password(body.new_password))
     return {"ok": True}
 
 
@@ -684,19 +694,19 @@ async def test_channel(channel_id: int, request: Request) -> dict[str, Any]:
 
 
 @protected.get("/keys")
-def list_keys(db: Database = Depends(get_db)) -> list[dict[str, Any]]:
-    return db.query("SELECT id, name, prefix, created_at, last_used_at FROM api_keys ORDER BY created_at DESC")
+def list_keys(users: UserStore = Depends(get_users)) -> list[dict[str, Any]]:
+    return users.list_api_keys()
 
 
 @protected.post("/keys", status_code=201)
-def add_key(body: ApiKeyIn, db: Database = Depends(get_db)) -> dict[str, Any]:
-    key_id, key = create_api_key(db, body.name.strip())
+def add_key(body: ApiKeyIn, users: UserStore = Depends(get_users)) -> dict[str, Any]:
+    key_id, key = create_api_key(users, body.name.strip())
     return {"id": key_id, "name": body.name.strip(), "key": key}
 
 
 @protected.delete("/keys/{key_id}", status_code=204)
-def delete_key(key_id: int, db: Database = Depends(get_db)) -> Response:
-    if db.execute("DELETE FROM api_keys WHERE id = ?", (key_id,)).rowcount == 0:
+def delete_key(key_id: int, users: UserStore = Depends(get_users)) -> Response:
+    if not users.delete_api_key(key_id):
         raise HTTPException(404, "API-Key nicht gefunden")
     return Response(status_code=204)
 

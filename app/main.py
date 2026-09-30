@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
@@ -14,10 +15,32 @@ from .config import Settings
 from .db import Database
 from .notifier import Notifier
 from .scheduler import Scheduler
+from .userstore import MariaDBUserStore, SqliteUserStore, UserStore, UserStoreError
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 AGENT_DIR = BASE_DIR.parent / "agent"
+
+
+def create_user_store(settings: Settings, db: Database) -> UserStore:
+    if not settings.user_db_host:
+        return SqliteUserStore(db)
+    missing = [
+        name for name, value in (
+            ("MONITOR_USER_DB_NAME", settings.user_db_name),
+            ("MONITOR_USER_DB_USER", settings.user_db_user),
+        ) if not value
+    ]
+    if missing:
+        raise RuntimeError(f"Für die Benutzer-Datenbank fehlen: {', '.join(missing)}")
+    return MariaDBUserStore(
+        host=settings.user_db_host,
+        port=settings.user_db_port,
+        user=settings.user_db_user,
+        password=settings.user_db_password,
+        database=settings.user_db_name,
+        user_table=settings.user_db_table,
+    )
 
 
 def create_app(settings: Settings | None = None, start_scheduler: bool = True) -> FastAPI:
@@ -25,10 +48,11 @@ def create_app(settings: Settings | None = None, start_scheduler: bool = True) -
     settings = settings or Settings()
     db = Database(settings.db_path)
     notifier = Notifier(db, settings.public_url)
+    users = create_user_store(settings, db)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        scheduler = Scheduler(db, notifier, settings.max_concurrent_checks, settings.retention_days)
+        scheduler = Scheduler(db, notifier, settings.max_concurrent_checks, settings.retention_days, users)
         app.state.scheduler = scheduler
         if start_scheduler:
             scheduler.start()
@@ -42,7 +66,13 @@ def create_app(settings: Settings | None = None, start_scheduler: bool = True) -
     app.state.settings = settings
     app.state.db = db
     app.state.notifier = notifier
+    app.state.users = users
     app.state.throttle = LoginThrottle()
+
+    @app.exception_handler(UserStoreError)
+    async def user_store_unavailable(request: Request, exc: UserStoreError):
+        logging.getLogger("monitoring").error("User database error: %s", exc)
+        return JSONResponse({"detail": f"Benutzer-Datenbank nicht erreichbar: {exc}"}, status_code=503)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):

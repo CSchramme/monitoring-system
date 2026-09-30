@@ -8,6 +8,7 @@ from typing import Any
 from .checks import CheckResult, PULL_TYPES, run_check
 from .db import Database
 from .notifier import Notifier
+from .userstore import UserStore
 from .service import purge_old_results, push_is_stale, record_result
 
 log = logging.getLogger("monitoring.scheduler")
@@ -24,8 +25,16 @@ def _format_age(seconds: float) -> str:
 
 
 class Scheduler:
-    def __init__(self, db: Database, notifier: Notifier, max_concurrent: int = 50, retention_days: int = 30):
+    def __init__(
+        self,
+        db: Database,
+        notifier: Notifier,
+        max_concurrent: int = 50,
+        retention_days: int = 30,
+        users: UserStore | None = None,
+    ):
         self.db = db
+        self.users = users
         self.notifier = notifier
         self.retention_days = retention_days
         self._semaphore = asyncio.Semaphore(max_concurrent)
@@ -73,6 +82,11 @@ class Scheduler:
             deleted = purge_old_results(self.db, self.retention_days, now)
             if deleted:
                 log.info("Purged %d old results", deleted)
+            if self.users is not None:
+                try:
+                    self.users.purge_sessions(now)
+                except Exception:
+                    log.exception("Purging expired sessions failed")
 
     def is_running(self, monitor_id: int) -> bool:
         return monitor_id in self._running

@@ -212,3 +212,8 @@ def test_ui_and_agent_served(client):
     assert index.headers["cache-control"] == "no-cache"
     agent = client.get("/agent/linux-agent.sh")
     assert agent.status_code == 200 and agent.text.startswith("#!")
+
+
+def test_password_hash_is_php_compatible_bcrypt(app, auth_client):
+    stored = app.state.users.get_user_by_name("admin")["password_hash"]
+    assert stored.startswith("$2y$12$")

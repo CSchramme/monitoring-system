@@ -1,0 +1,18 @@
+services:
+  monitoring:
+    build: .
+    container_name: monitoring
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Externe Adresse der Oberfläche (für Links in Benachrichtigungen und die Anbindungs-Beispiele)
+      MONITOR_PUBLIC_URL: "http://localhost:8080"
+      # Auf "true" setzen, sobald die Oberfläche über HTTPS erreichbar ist
+      MONITOR_SECURE_COOKIES: "false"
+      MONITOR_RETENTION_DAYS: "30"
+    volumes:
+      - monitoring-data:/data
+
+volumes:
+  monitoring-data:

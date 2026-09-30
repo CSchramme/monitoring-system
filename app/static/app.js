@@ -39,6 +39,11 @@ function s(tag, attrs, ...children) {
 
 const $ = (selector, root = document) => root.querySelector(selector);
 
+/** Append children; null/false entries are skipped (unlike Element.append). */
+function append(el, ...children) {
+  appendChildren(el, children);
+}
+
 /** Replace an element's children; null/false entries are skipped (unlike Element.replaceChildren). */
 function fill(el, ...children) {
   el.replaceChildren();
@@ -212,6 +217,12 @@ function statusEl(status) {
   return h("span", { class: `status status-${status}` }, h("span", { class: "dot", "aria-hidden": "true" }), STATUS[status] || status);
 }
 
+/** Mirrors the server's check: "*" = everything, "app.*" = every permission of that app. */
+function can(permission) {
+  const granted = (state.auth && state.auth.user && state.auth.user.permissions) || [];
+  return granted.some((p) => p === "*" || p === permission || (p.endsWith(".*") && permission.startsWith(p.slice(0, -1))));
+}
+
 function baseUrl() {
   return (state.auth && state.auth.public_url) || location.origin;
 }
@@ -335,12 +346,17 @@ async function route() {
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   let view;
   let section = "dashboard";
-  if (parts.length === 0) view = viewDashboard;
+  const needsView = parts.length === 0 || parts[0] === "monitor" || parts[0] === "channels";
+  const needsEdit = parts[0] === "channels" || (parts[0] === "monitor" && (parts[1] === "new" || parts[2] === "edit"));
+  if ((needsView && !can("monitoring.view")) || (needsEdit && !can("monitoring.edit"))) view = viewNoAccess;
+  else if (parts[0] === "users" && !can("users.manage")) view = viewNoAccess;
+  else if (parts.length === 0) view = viewDashboard;
   else if (parts[0] === "monitor" && parts[1] === "new") view = (main) => viewMonitorForm(main, null);
   else if (parts[0] === "monitor" && /^\d+$/.test(parts[1] || "") && parts[2] === "edit") view = (main) => viewMonitorForm(main, Number(parts[1]));
   else if (parts[0] === "monitor" && /^\d+$/.test(parts[1] || "")) view = (main) => viewMonitorDetail(main, Number(parts[1]));
   else if (parts[0] === "channels") { view = viewChannels; section = "channels"; }
   else if (parts[0] === "settings") { view = viewSettings; section = "settings"; }
+  else if (parts[0] === "users") { view = viewUsers; section = "users"; }
   else {
     location.hash = "#/";
     return;
@@ -394,8 +410,9 @@ function renderShell(section) {
       h("div", { class: "topbar-inner" },
         h("a", { class: "brand", href: "#/", "aria-label": "Monitoring – Übersicht" }, brandMark(), h("span", { class: "brand-text" }, "Monitoring")),
         h("nav", { class: "nav", "aria-label": "Hauptnavigation" },
-          link("#/", "Übersicht", "dashboard"),
-          link("#/channels", "Benachrichtigungen", "channels"),
+          can("monitoring.view") ? link("#/", "Übersicht", "dashboard") : null,
+          can("monitoring.edit") ? link("#/channels", "Benachrichtigungen", "channels") : null,
+          can("users.manage") ? link("#/users", "Benutzer & Rechte", "users") : null,
           link("#/settings", "Anbindung & Einstellungen", "settings")),
         h("div", { class: "topbar-right" },
           themeButton(),
@@ -521,7 +538,9 @@ function emptyDashboard() {
     h("div", { class: "how-grid" },
       how("Pull – der Server prüft", "Websites & APIs (HTTP), Ports (TCP), Ping und DNS. Auf dem Zielsystem muss nichts installiert werden."),
       how("Push – das System meldet sich", "Jedes System, das eine URL aufrufen kann: Server-Agent (CPU, RAM, Disk), Cronjobs, Backups, Home Assistant, IoT, Skripte. Funktioniert auch hinter NAT/Firewall.")),
-    h("a", { class: "btn btn-primary", href: "#/monitor/new" }, "+ Ersten Monitor anlegen"));
+    can("monitoring.edit")
+      ? h("a", { class: "btn btn-primary", href: "#/monitor/new" }, "+ Ersten Monitor anlegen")
+      : h("p", { class: "muted" }, "Du hast nur Leserechte – Monitore legt ein Bearbeiter an."));
 }
 
 async function viewDashboard(main) {
@@ -551,10 +570,10 @@ async function viewDashboard(main) {
   const toolbar = h("div", { class: "toolbar" }, search, groupSelect, statusSelect);
   const content = h("div", { class: "grid-2" }, h("div", null, toolbar, listEl), eventsEl);
 
-  main.append(
+  append(main, 
     h("div", { class: "page-head" },
       h("div", null, h("h1", null, "Übersicht"), h("div", { class: "sub" }, "Alle überwachten Systeme auf einen Blick")),
-      h("a", { class: "btn btn-primary", href: "#/monitor/new" }, "+ Neuer Monitor")),
+      can("monitoring.edit") ? h("a", { class: "btn btn-primary", href: "#/monitor/new" }, "+ Neuer Monitor") : null),
     tilesEl, content);
 
   function renderTiles() {
@@ -898,7 +917,7 @@ async function viewMonitorDetail(main, id) {
   const integrationEl = h("div");
   const eventsEl = h("div", { class: "card" });
 
-  main.append(
+  append(main, 
     h("a", { href: "#/", class: "small" }, "← Übersicht"),
     h("div", { style: "height:8px" }),
     headEl, tilesEl,
@@ -940,7 +959,7 @@ async function viewMonitorDetail(main, id) {
           monitor.group_name ? ` · Gruppe: ${monitor.group_name}` : "",
           ` · Intervall ${fmtInterval(monitor.interval)}`),
         monitor.last_message ? h("div", { class: "sub" }, "Letzte Meldung: ", monitor.last_message) : null),
-      h("div", { class: "row" },
+      !can("monitoring.edit") ? null : h("div", { class: "row" },
         checkButton,
         monitor.enabled
           ? h("button", { type: "button", class: "btn", onclick: () => act(() => api("POST", `/api/monitors/${id}/pause`), "Monitor pausiert") }, "Pausieren")
@@ -1060,7 +1079,7 @@ async function viewMonitorDetail(main, id) {
   }
 
   function renderIntegration() {
-    if (monitor.type !== "push") {
+    if (monitor.type !== "push" || !monitor.push_path) {
       fill(integrationEl);
       return;
     }
@@ -1172,7 +1191,7 @@ async function viewMonitorForm(main, id) {
 
   const title = existing ? `„${existing.name}“ bearbeiten` : "Neuer Monitor";
   const formEl = h("form", { class: "fields", novalidate: true });
-  main.append(
+  append(main, 
     h("a", { href: existing ? `#/monitor/${id}` : "#/", class: "small" }, "← Zurück"),
     h("div", { style: "height:8px" }),
     h("div", { class: "page-head" }, h("h1", null, title)),
@@ -1350,6 +1369,7 @@ async function viewMonitorForm(main, id) {
  * ===================================================================== */
 
 const CHANNEL_TYPES = {
+  webpush: { label: "App-Push (Handy & Browser)", short: "App-Push", fields: [] },
   discord: { label: "Discord", short: "Discord", fields: [["url", "Webhook-URL", "url", true, "", "Servereinstellungen → Integrationen → Webhooks"]] },
   telegram: {
     label: "Telegram",
@@ -1410,7 +1430,7 @@ async function viewChannels(main) {
 
   const formHost = h("div");
   const listHost = h("div");
-  main.append(
+  append(main, 
     h("div", { class: "page-head" },
       h("div", null, h("h1", null, "Benachrichtigungen"), h("div", { class: "sub" }, "Kanäle, über die bei Statuswechseln alarmiert wird. Pro Monitor auswählbar.")),
       h("button", { type: "button", class: "btn btn-primary", onclick: () => { editing = "new"; renderForm(); } }, "+ Kanal hinzufügen")),
@@ -1548,6 +1568,357 @@ async function viewChannels(main) {
 }
 
 /* =====================================================================
+ * Installable app & push notifications
+ * ===================================================================== */
+
+let installPrompt = null;
+window.addEventListener("beforeinstallprompt", (event) => {
+  event.preventDefault();
+  installPrompt = event;
+});
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").catch(() => { /* e.g. plain http on a LAN address */ });
+}
+
+const isStandalone = () => matchMedia("(display-mode: standalone)").matches || navigator.standalone === true;
+const isIOS = () => /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const pushSupported = () => "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+
+function base64UrlToBytes(value) {
+  const padded = (value + "===".slice((value.length + 3) % 4)).replace(/-/g, "+").replace(/_/g, "/");
+  return Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
+}
+
+async function currentSubscription() {
+  if (!pushSupported()) return null;
+  const registration = await navigator.serviceWorker.ready;
+  return registration.pushManager.getSubscription();
+}
+
+async function enablePush() {
+  if (Notification.permission === "denied") throw new Error("Benachrichtigungen sind für diese Seite blockiert – bitte in den Browser-/Systemeinstellungen erlauben.");
+  const permission = await Notification.requestPermission();
+  if (permission !== "granted") throw new Error("Benachrichtigungen wurden nicht erlaubt");
+  const info = await api("GET", "/api/webpush");
+  const registration = await navigator.serviceWorker.ready;
+  let subscription = await registration.pushManager.getSubscription();
+  if (!subscription) {
+    subscription = await registration.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: base64UrlToBytes(info.public_key) });
+  }
+  const json = subscription.toJSON();
+  await api("POST", "/api/webpush/subscriptions", { endpoint: json.endpoint, keys: json.keys });
+}
+
+async function disablePush() {
+  const subscription = await currentSubscription();
+  if (!subscription) return;
+  await api("POST", "/api/webpush/unsubscribe", { endpoint: subscription.endpoint });
+  await subscription.unsubscribe();
+}
+
+/** Make sure an "App-Push" channel exists and is attached to every monitor (editors only). */
+async function attachPushChannelToAllMonitors() {
+  const channels = await api("GET", "/api/channels");
+  let channel = channels.find((c) => c.type === "webpush");
+  if (!channel) channel = await api("POST", "/api/channels", { name: "App-Push", type: "webpush", config: {}, enabled: true });
+  const monitors = await api("GET", "/api/monitors");
+  let changed = 0;
+  for (const m of monitors) {
+    if (m.channel_ids.includes(channel.id)) continue;
+    await api("PUT", `/api/monitors/${m.id}`, {
+      name: m.name, type: m.type, target: m.target, group_name: m.group_name, interval: m.interval, timeout: m.timeout,
+      retries: m.retries, config: m.config, channel_ids: [...m.channel_ids, channel.id], enabled: m.enabled,
+    });
+    changed += 1;
+  }
+  return changed;
+}
+
+function appCard() {
+  const installEl = h("div");
+  const pushEl = h("div", { class: "fields", style: "gap:10px" });
+
+  function renderInstall() {
+    let content;
+    if (isStandalone()) {
+      content = h("div", null, statusEl("up"), " Läuft als installierte App.");
+    } else if (installPrompt) {
+      content = h("button", {
+        type: "button", class: "btn btn-primary", onclick: async () => {
+          installPrompt.prompt();
+          await installPrompt.userChoice.catch(() => null);
+          installPrompt = null;
+          renderInstall();
+        },
+      }, "App auf diesem Gerät installieren");
+    } else if (isIOS()) {
+      content = h("div", { class: "muted" }, "iPhone/iPad: In Safari auf ", h("strong", null, "Teilen"), " (Quadrat mit Pfeil) tippen → ",
+        h("strong", null, "Zum Home-Bildschirm"), ". Danach die App vom Home-Bildschirm öffnen.");
+    } else {
+      content = h("div", { class: "muted" }, "Im Browsermenü „App installieren“ bzw. „Zum Startbildschirm hinzufügen“ wählen (Chrome, Edge, Samsung Internet).");
+    }
+    fill(installEl, h("div", { class: "field-label" }, "Auf den Homebildschirm"), content);
+  }
+
+  async function renderPush() {
+    const head = h("div", { class: "field-label" }, "Push-Benachrichtigungen auf diesem Gerät");
+    if (!window.isSecureContext) {
+      return fill(pushEl, head, h("div", { class: "notice warn" }, "Push und App-Installation brauchen HTTPS. Richte die Oberfläche über HTTPS ein (z. B. mit Let's Encrypt in Plesk)."));
+    }
+    if (!pushSupported()) {
+      return fill(pushEl, head, h("div", { class: "muted" }, isIOS() && !isStandalone()
+        ? "Auf iPhone/iPad funktionieren Push-Benachrichtigungen nur in der installierten App (ab iOS 16.4): erst zum Home-Bildschirm hinzufügen, dann dort öffnen und hier aktivieren."
+        : "Dieser Browser unterstützt keine Push-Benachrichtigungen."));
+    }
+    let subscription = null;
+    let info = { endpoints: [] };
+    try {
+      [subscription, info] = await Promise.all([currentSubscription(), api("GET", "/api/webpush")]);
+    } catch (e) {
+      return fill(pushEl, head, h("div", { class: "muted" }, e.message));
+    }
+    const active = !!subscription && info.endpoints.includes(subscription.endpoint);
+    const busy = (button, fn) => async () => {
+      button.disabled = true;
+      try {
+        await fn();
+      } catch (e) {
+        reportError(e);
+      } finally {
+        button.disabled = false;
+        renderPush();
+      }
+    };
+    const enable = h("button", { type: "button", class: "btn btn-primary" }, "Push aktivieren");
+    enable.addEventListener("click", busy(enable, async () => {
+      await enablePush();
+      toast("Push-Benachrichtigungen aktiviert");
+      if (can("monitoring.edit")) {
+        const changed = await attachPushChannelToAllMonitors();
+        if (changed) toast(`Kanal „App-Push“ an ${changed} Monitor(e) angehängt`);
+      }
+    }));
+    const test = h("button", { type: "button", class: "btn" }, "Testnachricht senden");
+    test.addEventListener("click", busy(test, async () => {
+      await api("POST", "/api/webpush/test");
+      toast("Testnachricht gesendet");
+    }));
+    const disable = h("button", { type: "button", class: "btn btn-danger" }, "Deaktivieren");
+    disable.addEventListener("click", busy(disable, async () => {
+      await disablePush();
+      toast("Push auf diesem Gerät deaktiviert");
+    }));
+    fill(pushEl, head,
+      active
+        ? h("div", null, statusEl("up"), " Aktiv – Alarme aller Monitore mit dem Kanal „App-Push“ kommen auf dieses Gerät.")
+        : h("div", { class: "muted" }, "Du bekommst Störungen und Entwarnungen als Benachrichtigung aufs Handy oder den Desktop – auch wenn die App geschlossen ist."),
+      h("div", { class: "row" }, active ? [test, disable] : enable),
+      active && can("monitoring.edit") ? h("div", { class: "small muted" }, "Neue Monitore bekommen den Kanal automatisch, wenn er beim Anlegen angehakt ist (Standard).") : null);
+  }
+
+  renderInstall();
+  renderPush();
+  window.addEventListener("appinstalled", renderInstall, { once: true });
+  return h("div", { class: "card" },
+    h("div", { class: "card-head" }, h("div", null, h("h2", null, "Handy-App & Push"),
+      h("div", { class: "hint" }, "Monitoring als App auf den Homebildschirm legen und bei Störungen sofort benachrichtigt werden."))),
+    h("div", { class: "card-pad fields" }, installEl, pushEl));
+}
+
+/* =====================================================================
+ * Access denied / users & rights
+ * ===================================================================== */
+
+async function viewNoAccess(main) {
+  const none = !(state.auth.user.permissions || []).length;
+  append(main, h("div", { class: "card empty-state" },
+    h("h2", null, none ? "Noch keine Berechtigungen" : "Keine Berechtigung"),
+    h("p", null, none
+      ? `Dein Konto „${state.auth.user.name}“ ist angemeldet, hat aber noch keine Rolle. Ein Administrator muss dir unter „Benutzer & Rechte“ eine Rolle zuweisen.`
+      : "Für diese Seite fehlt dir die nötige Berechtigung."),
+    none ? h("p", { class: "small muted" }, "Noch gar kein Administrator vorhanden? Auf dem Server: ", h("code", null, `python -m app.cli grant-admin ${state.auth.user.name}`)) : null,
+    h("a", { class: "btn", href: "#/settings" }, "Zu den Einstellungen")));
+}
+
+async function viewUsers(main) {
+  let users = [];
+  let roles = [];
+  let catalogue = [];
+  let editingUser = null; // null | "new" | user
+  let editingRole = null; // null | "new" | role
+
+  const userForm = h("div");
+  const userList = h("div");
+  const roleForm = h("div");
+  const roleList = h("div");
+  const card = (title, hint, action, ...content) => h("div", { class: "card" },
+    h("div", { class: "card-head" }, h("div", null, h("h2", null, title), hint ? h("div", { class: "hint" }, hint) : null), action),
+    content);
+
+  append(main, 
+    h("div", { class: "page-head" }, h("div", null,
+      h("h1", null, "Benutzer & Rechte"),
+      h("div", { class: "sub" }, `Globale Benutzerverwaltung – gespeichert in: ${state.auth.user_db}`))),
+    card("Benutzer", "Rechte ergeben sich aus den zugewiesenen Rollen und gelten sofort.",
+      h("button", { type: "button", class: "btn btn-primary btn-sm", onclick: () => { editingUser = "new"; renderUserForm(); } }, "+ Benutzer"),
+      userForm, userList),
+    card("Rollen", "Eine Rolle bündelt Berechtigungen. Andere Anwendungen können eigene Berechtigungen wie „shop.orders.view“ nutzen.",
+      h("button", { type: "button", class: "btn btn-primary btn-sm", onclick: () => { editingRole = "new"; renderRoleForm(); } }, "+ Rolle"),
+      roleForm, roleList));
+
+  async function load() {
+    [users, roles, catalogue] = await Promise.all([api("GET", "/api/users"), api("GET", "/api/roles"), api("GET", "/api/permissions")]);
+    renderUsers();
+    renderRoles();
+  }
+
+  const roleName = (id) => (roles.find((r) => r.id === id) || { name: `#${id}` }).name;
+
+  function renderUsers() {
+    fill(userList, users.length
+      ? h("div", { class: "table-scroll" }, h("table", { class: "data" },
+        h("thead", null, h("tr", null, h("th", null, "Benutzer"), h("th", null, "Rollen"), h("th", null, ""))),
+        h("tbody", null, users.map((u) => h("tr", null,
+          h("td", null, h("strong", null, u.username), u.username === state.auth.user.name ? h("span", { class: "muted" }, " (du)") : null),
+          h("td", null, u.role_ids.length
+            ? u.role_ids.map((id) => [h("span", { class: "badge" }, roleName(id)), " "])
+            : h("span", { class: "muted" }, "keine Rolle – kein Zugriff")),
+          h("td", { class: "num", style: "white-space:nowrap" },
+            h("button", { type: "button", class: "btn btn-sm", onclick: () => { editingUser = u; renderUserForm(); } }, "Bearbeiten"), " ",
+            u.username === state.auth.user.name ? null : h("button", {
+              type: "button", class: "btn btn-sm btn-danger", onclick: async () => {
+                if (!confirm(`Benutzer „${u.username}“ löschen? Die Benutzer-Datenbank ist global – das Konto fehlt danach auch in anderen Anwendungen.`)) return;
+                try {
+                  await api("DELETE", `/api/users/${u.id}`);
+                  toast("Benutzer gelöscht");
+                  await load();
+                } catch (e) {
+                  reportError(e);
+                }
+              },
+            }, "Löschen")))))))
+      : h("div", { class: "card-pad muted" }, "Keine Benutzer."));
+  }
+
+  function renderUserForm() {
+    if (!editingUser) return fill(userForm);
+    const isNew = editingUser === "new";
+    const draft = { username: isNew ? "" : editingUser.username, password: "", role_ids: isNew ? [] : [...editingUser.role_ids] };
+    const submit = h("button", { type: "submit", class: "btn btn-primary" }, "Speichern");
+    const form = h("form", { class: "card-pad fields", style: "border-bottom:1px solid var(--border)" },
+      h("h3", null, isNew ? "Neuer Benutzer" : `„${editingUser.username}“ bearbeiten`),
+      h("div", { class: "fields-2" },
+        textField("Benutzername", { type: "text", required: true, maxlength: 64, autocomplete: "off", value: draft.username, onInput: (e) => { draft.username = e.target.value; } }),
+        textField(isNew ? "Passwort" : "Neues Passwort", {
+          type: "password", autocomplete: "new-password", minlength: 8, required: isNew,
+          placeholder: isNew ? "" : "leer lassen = unverändert", onInput: (e) => { draft.password = e.target.value; },
+        }, "Mindestens 8 Zeichen")),
+      h("div", null, h("div", { class: "field-label" }, "Rollen"),
+        h("div", { class: "fields", style: "gap:8px" }, roles.map((r) => h("label", { class: "check" },
+          h("input", {
+            type: "checkbox", checked: draft.role_ids.includes(r.id), onChange: (e) => {
+              draft.role_ids = e.target.checked ? [...draft.role_ids, r.id] : draft.role_ids.filter((x) => x !== r.id);
+            },
+          }),
+          h("span", null, h("strong", null, r.name), r.description ? h("span", { class: "muted" }, ` – ${r.description}`) : null))))),
+      h("div", { class: "row" }, submit, h("button", { type: "button", class: "btn btn-ghost", onclick: () => { editingUser = null; renderUserForm(); } }, "Abbrechen")));
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      submit.disabled = true;
+      try {
+        const body = { username: draft.username.trim(), password: draft.password || null, role_ids: draft.role_ids };
+        if (isNew) await api("POST", "/api/users", body);
+        else await api("PUT", `/api/users/${editingUser.id}`, body);
+        toast("Benutzer gespeichert");
+        const self = !isNew && editingUser.username === state.auth.user.name;
+        editingUser = null;
+        renderUserForm();
+        if (self) {
+          // Own rights may have changed: reload status and navigation.
+          state.auth = await api("GET", "/api/auth/status");
+          return route();
+        }
+        await load();
+      } catch (e) {
+        reportError(e);
+      } finally {
+        submit.disabled = false;
+      }
+    });
+    fill(userForm, form);
+    $("input", form).focus();
+  }
+
+  function renderRoles() {
+    fill(roleList, h("div", null, roles.map((r) => h("div", { class: "list-item" },
+      h("div", { class: "grow" },
+        h("div", { class: "row" }, h("strong", null, r.name), h("span", { class: "muted small" }, `${r.user_count} Benutzer`)),
+        r.description ? h("div", { class: "small muted" }, r.description) : null,
+        h("div", { class: "row", style: "margin-top:4px;gap:4px" },
+          r.permissions.length ? r.permissions.map((p) => h("code", { class: "badge", style: "text-transform:none" }, p)) : h("span", { class: "small muted" }, "keine Berechtigungen"))),
+      h("button", { type: "button", class: "btn btn-sm", onclick: () => { editingRole = r; renderRoleForm(); } }, "Bearbeiten"),
+      h("button", {
+        type: "button", class: "btn btn-sm btn-danger", onclick: async () => {
+          if (!confirm(`Rolle „${r.name}“ löschen? ${r.user_count} Benutzer verlieren diese Rechte.`)) return;
+          try {
+            await api("DELETE", `/api/roles/${r.id}`);
+            toast("Rolle gelöscht");
+            await load();
+          } catch (e) {
+            reportError(e);
+          }
+        },
+      }, "Löschen")))));
+  }
+
+  function renderRoleForm() {
+    if (!editingRole) return fill(roleForm);
+    const isNew = editingRole === "new";
+    const draft = { name: isNew ? "" : editingRole.name, description: isNew ? "" : editingRole.description, permissions: new Set(isNew ? [] : editingRole.permissions) };
+    const known = catalogue.filter((c) => c.description).map((c) => c.permission);
+    let extra = [...draft.permissions].filter((p) => !known.includes(p)).join("\n");
+    const submit = h("button", { type: "submit", class: "btn btn-primary" }, "Speichern");
+    const form = h("form", { class: "card-pad fields", style: "border-bottom:1px solid var(--border)" },
+      h("h3", null, isNew ? "Neue Rolle" : `Rolle „${editingRole.name}“ bearbeiten`),
+      h("div", { class: "fields-2" },
+        textField("Name", { type: "text", required: true, maxlength: 100, value: draft.name, onInput: (e) => { draft.name = e.target.value; } }),
+        textField("Beschreibung", { type: "text", maxlength: 255, value: draft.description, onInput: (e) => { draft.description = e.target.value; } })),
+      h("div", null, h("div", { class: "field-label" }, "Berechtigungen"),
+        h("div", { class: "fields", style: "gap:8px" }, catalogue.filter((c) => c.description).map((c) => h("label", { class: "check" },
+          h("input", { type: "checkbox", checked: draft.permissions.has(c.permission), onChange: (e) => { if (e.target.checked) draft.permissions.add(c.permission); else draft.permissions.delete(c.permission); } }),
+          h("span", null, h("code", null, c.permission), h("span", { class: "muted" }, ` – ${c.description}`)))))),
+      h("label", { class: "field" }, h("span", null, "Weitere Berechtigungen (andere Anwendungen)"),
+        h("textarea", { placeholder: "eine pro Zeile, z. B.\nshop.orders.view\nwiki.*", value: extra, onInput: (e) => { extra = e.target.value; } }),
+        h("div", { class: "help" }, "Format: anwendung.aktion – „anwendung.*“ erlaubt alles in dieser Anwendung, „*“ alles überall.")),
+      h("div", { class: "row" }, submit, h("button", { type: "button", class: "btn btn-ghost", onclick: () => { editingRole = null; renderRoleForm(); } }, "Abbrechen")));
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const permissions = [...[...draft.permissions].filter((p) => known.includes(p)), ...extra.split(/[\s,]+/).filter(Boolean)];
+      submit.disabled = true;
+      try {
+        const body = { name: draft.name.trim(), description: draft.description.trim(), permissions };
+        if (isNew) await api("POST", "/api/roles", body);
+        else await api("PUT", `/api/roles/${editingRole.id}`, body);
+        toast("Rolle gespeichert");
+        editingRole = null;
+        renderRoleForm();
+        state.auth = await api("GET", "/api/auth/status");
+        if (!can("users.manage")) return route();
+        await load();
+      } catch (e) {
+        reportError(e);
+      } finally {
+        submit.disabled = false;
+      }
+    });
+    fill(roleForm, form);
+    $("input", form).focus();
+  }
+
+  await load();
+}
+
+/* =====================================================================
  * Settings & integration
  * ===================================================================== */
 
@@ -1560,10 +1931,11 @@ async function viewSettings(main) {
     const keys = await api("GET", "/api/keys");
     fill(keysHost, keys.length
       ? h("div", { class: "table-scroll" }, h("table", { class: "data" },
-        h("thead", null, h("tr", null, h("th", null, "Name"), h("th", null, "Schlüssel"), h("th", null, "Erstellt"), h("th", null, "Zuletzt benutzt"), h("th", null, ""))),
+        h("thead", null, h("tr", null, h("th", null, "Name"), h("th", null, "Schlüssel"), can("users.manage") ? h("th", null, "Besitzer") : null, h("th", null, "Erstellt"), h("th", null, "Zuletzt benutzt"), h("th", null, ""))),
         h("tbody", null, keys.map((k) => h("tr", null,
           h("td", null, k.name),
           h("td", { class: "mono" }, k.prefix + "…"),
+          can("users.manage") ? h("td", null, k.username || h("span", { class: "muted" }, "– (Vollzugriff)")) : null,
           h("td", null, fmtDateTime(k.created_at)),
           h("td", null, k.last_used_at ? fmtAgo(k.last_used_at) : "nie"),
           h("td", { class: "num" }, h("button", {
@@ -1620,8 +1992,9 @@ async function viewSettings(main) {
     h("div", { class: "card-head" }, h("div", null, h("h2", null, title), hint ? h("div", { class: "hint" }, hint) : null)),
     h("div", { class: "card-pad fields" }, content));
 
-  main.append(
-    h("div", { class: "page-head" }, h("div", null, h("h1", null, "Anbindung & Einstellungen"), h("div", { class: "sub" }, "Schnittstellen, API-Zugriff und Konto"))),
+  append(main, 
+    h("div", { class: "page-head" }, h("div", null, h("h1", null, "Anbindung & Einstellungen"), h("div", { class: "sub" }, "App, Schnittstellen, API-Zugriff und Konto"))),
+    can("monitoring.view") ? appCard() : null,
     card("Wie Systeme angebunden werden", null,
       h("div", { class: "how-grid", style: "margin:0" },
         h("div", { class: "card" }, h("strong", null, "Pull (HTTP, TCP, Ping, DNS)"),
@@ -1638,7 +2011,7 @@ async function viewSettings(main) {
         codeBlock(`curl -X POST ${base}/api/monitors \\\n  -H "Authorization: Bearer <API-KEY>" -H "Content-Type: application/json" \\\n  -d '{"name": "Webshop", "type": "http", "target": "https://shop.example.com", "interval": 60}'`))),
     card("Prometheus / Grafana", "Status, Antwortzeiten und alle Push-Metriken im Prometheus-Format.",
       codeBlock(`scrape_configs:\n  - job_name: monitoring\n    scheme: ${location.protocol.replace(":", "")}\n    metrics_path: /metrics\n    authorization:\n      credentials: <API-KEY>\n    static_configs:\n      - targets: ["${location.host}"]`)),
-    card("API-Keys", "Für REST-API und Prometheus. Keys haben vollen Zugriff – nur an vertrauenswürdige Systeme geben.",
+    card("API-Keys", "Für REST-API und Prometheus. Ein Key handelt mit den Rechten seines Besitzers – nur an vertrauenswürdige Systeme geben.",
       keyForm, newKeyHost, keysHost),
     card("Konto", `Angemeldet als ${state.auth.user.name}`, pwForm),
     card("System", null,

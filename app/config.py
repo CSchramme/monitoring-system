@@ -35,6 +35,17 @@ class Settings:
     user_db_password: str = field(default_factory=lambda: os.environ.get("MONITOR_USER_DB_PASSWORD", ""), repr=False)
     user_db_table: str = field(default_factory=lambda: os.environ.get("MONITOR_USER_DB_TABLE", "users"))
 
+    # Contact for Web Push services (VAPID "sub" claim): mailto: address or https URL.
+    vapid_subject: str = field(default_factory=lambda: os.environ.get("MONITOR_VAPID_SUBJECT", ""))
+
+    @property
+    def push_subject(self) -> str:
+        if self.vapid_subject:
+            return self.vapid_subject
+        if self.public_url.startswith("https://"):
+            return self.public_url
+        return "mailto:monitoring@example.com"
+
     @property
     def user_db_label(self) -> str:
         if not self.user_db_host:

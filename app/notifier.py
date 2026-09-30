@@ -15,10 +15,11 @@ from .service import Transition
 
 log = logging.getLogger("monitoring.notifier")
 
-CHANNEL_TYPES = ("webhook", "discord", "slack", "telegram", "ntfy", "email")
+CHANNEL_TYPES = ("webpush", "webhook", "discord", "slack", "telegram", "ntfy", "email")
 
 # Required config keys per channel type (used for validation in the API).
 CHANNEL_REQUIRED: dict[str, tuple[str, ...]] = {
+    "webpush": (),
     "webhook": ("url",),
     "discord": ("url",),
     "slack": ("url",),
@@ -39,6 +40,7 @@ class Notifier:
         self.db = db
         self.public_url = public_url
         self._tasks: set[asyncio.Task] = set()
+        self.webpush = None  # set by the app (app.webpush.WebPush)
 
     def dispatch(self, transition: Transition | None) -> None:
         """Fire-and-forget delivery for a status change. Must be called from the event loop."""
@@ -126,6 +128,17 @@ class Notifier:
         kind = channel["type"]
         if kind == "email":
             await asyncio.to_thread(_send_email, cfg, payload)
+            return
+        if kind == "webpush":
+            if self.webpush is None:
+                raise NotificationError("Web-Push ist nicht verfügbar")
+            from .webpush import push_message
+
+            delivered, errors = await self.webpush.send(push_message(payload))
+            if errors:
+                raise NotificationError(f"{len(errors)} Gerät(e) nicht erreicht: {errors[0]}")
+            if delivered == 0:
+                raise NotificationError("Noch kein Gerät hat Push-Benachrichtigungen aktiviert")
             return
 
         async with httpx.AsyncClient(timeout=15) as client:

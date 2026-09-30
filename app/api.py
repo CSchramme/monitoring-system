@@ -20,6 +20,7 @@ from .auth import (
     delete_session,
     hash_password,
     new_push_token,
+    require,
     verify_password,
 )
 from .checks import (
@@ -35,11 +36,14 @@ from .checks import (
 )
 from .db import Database
 from .notifier import CHANNEL_REQUIRED
-from .userstore import UserStore
+from .userstore import PERMISSIONS, UserConflict, UserStore, has_permission, is_valid_permission
 from .service import bucket_results, recent_beats, record_result, uptime_by_monitor
 
 router = APIRouter(prefix="/api")
 protected = APIRouter(prefix="/api", dependencies=[Depends(authenticate)])
+viewer = APIRouter(prefix="/api", dependencies=[Depends(require("monitoring.view"))])
+editor = APIRouter(prefix="/api", dependencies=[Depends(require("monitoring.edit"))])
+user_admin = APIRouter(prefix="/api", dependencies=[Depends(require("users.manage"))])
 
 RANGES = {"1h": 3600, "24h": 86400, "7d": 7 * 86400, "30d": 30 * 86400}
 MAX_PUSH_METRICS = 50
@@ -82,7 +86,7 @@ class MonitorIn(BaseModel):
 
 class ChannelIn(BaseModel):
     name: str = Field(min_length=1, max_length=100)
-    type: Literal["webhook", "discord", "slack", "telegram", "ntfy", "email"]
+    type: Literal["webpush", "webhook", "discord", "slack", "telegram", "ntfy", "email"]
     config: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
 
@@ -232,6 +236,20 @@ def serialize_monitor(db: Database, monitor: dict[str, Any], with_channels: bool
     return data
 
 
+def _can_edit(principal: dict) -> bool:
+    return has_permission(principal["permissions"], "monitoring.edit")
+
+
+def _redact_monitor(data: dict[str, Any], principal: dict) -> dict[str, Any]:
+    """Push tokens and request headers (may contain credentials) are only visible to editors."""
+    if not _can_edit(principal):
+        data["push_token"] = None
+        data["push_path"] = None
+        if data["type"] == "http":
+            data["config"] = {**data["config"], "headers": {}, "body": ""}
+    return data
+
+
 def load_monitor(db: Database, monitor_id: int) -> dict[str, Any]:
     monitor = db.one("SELECT * FROM monitors WHERE id = ?", (monitor_id,))
     if monitor is None:
@@ -292,7 +310,7 @@ def auth_status(request: Request, users: UserStore = Depends(get_users)) -> dict
     user = None
     try:
         principal = authenticate(request)
-        user = {"name": principal["name"], "kind": principal["kind"]}
+        user = {"name": principal["name"], "kind": principal["kind"], "permissions": sorted(principal["permissions"])}
     except HTTPException:
         pass
     settings = request.app.state.settings
@@ -356,8 +374,8 @@ def change_password(
 # =========================================================================== monitors
 
 
-@protected.get("/monitors")
-def list_monitors(db: Database = Depends(get_db)) -> list[dict[str, Any]]:
+@viewer.get("/monitors")
+def list_monitors(db: Database = Depends(get_db), principal: dict = Depends(authenticate)) -> list[dict[str, Any]]:
     now = time.time()
     uptime = uptime_by_monitor(db, now - 86400)
     links: dict[int, list[int]] = {}
@@ -369,11 +387,11 @@ def list_monitors(db: Database = Depends(get_db)) -> list[dict[str, Any]]:
         data["channel_ids"] = links.get(monitor["id"], [])
         data["uptime_24h"] = uptime.get(monitor["id"])
         data["beats"] = recent_beats(db, monitor["id"])
-        monitors.append(data)
+        monitors.append(_redact_monitor(data, principal))
     return monitors
 
 
-@protected.post("/monitors", status_code=201)
+@editor.post("/monitors", status_code=201)
 def create_monitor(body: MonitorIn, db: Database = Depends(get_db)) -> dict[str, Any]:
     target = validate_target(body.type, body.target)
     config = normalize_config(body.type, body.config)
@@ -397,9 +415,11 @@ def create_monitor(body: MonitorIn, db: Database = Depends(get_db)) -> dict[str,
     return serialize_monitor(db, load_monitor(db, monitor_id))
 
 
-@protected.get("/monitors/{monitor_id}")
-def get_monitor(monitor_id: int, db: Database = Depends(get_db)) -> dict[str, Any]:
-    data = serialize_monitor(db, load_monitor(db, monitor_id))
+@viewer.get("/monitors/{monitor_id}")
+def get_monitor(
+    monitor_id: int, db: Database = Depends(get_db), principal: dict = Depends(authenticate)
+) -> dict[str, Any]:
+    data = _redact_monitor(serialize_monitor(db, load_monitor(db, monitor_id)), principal)
     now = time.time()
     stats = db.one(
         """
@@ -425,7 +445,7 @@ def get_monitor(monitor_id: int, db: Database = Depends(get_db)) -> dict[str, An
     return data
 
 
-@protected.put("/monitors/{monitor_id}")
+@editor.put("/monitors/{monitor_id}")
 def update_monitor(monitor_id: int, body: MonitorIn, db: Database = Depends(get_db)) -> dict[str, Any]:
     target = validate_target(body.type, body.target)
     config = normalize_config(body.type, body.config)
@@ -477,7 +497,7 @@ def update_monitor(monitor_id: int, body: MonitorIn, db: Database = Depends(get_
     return serialize_monitor(db, load_monitor(db, monitor_id))
 
 
-@protected.delete("/monitors/{monitor_id}", status_code=204)
+@editor.delete("/monitors/{monitor_id}", status_code=204)
 def delete_monitor(monitor_id: int, db: Database = Depends(get_db)) -> Response:
     load_monitor(db, monitor_id)
     db.execute("DELETE FROM monitors WHERE id = ?", (monitor_id,))
@@ -507,17 +527,17 @@ def _set_enabled(db: Database, monitor_id: int, enabled: bool) -> dict[str, Any]
     return serialize_monitor(db, load_monitor(db, monitor_id))
 
 
-@protected.post("/monitors/{monitor_id}/pause")
+@editor.post("/monitors/{monitor_id}/pause")
 def pause_monitor(monitor_id: int, db: Database = Depends(get_db)) -> dict[str, Any]:
     return _set_enabled(db, monitor_id, False)
 
 
-@protected.post("/monitors/{monitor_id}/resume")
+@editor.post("/monitors/{monitor_id}/resume")
 def resume_monitor(monitor_id: int, db: Database = Depends(get_db)) -> dict[str, Any]:
     return _set_enabled(db, monitor_id, True)
 
 
-@protected.post("/monitors/{monitor_id}/check")
+@editor.post("/monitors/{monitor_id}/check")
 async def check_now(monitor_id: int, request: Request) -> dict[str, Any]:
     db: Database = request.app.state.db
     monitor = load_monitor(db, monitor_id)
@@ -530,7 +550,7 @@ async def check_now(monitor_id: int, request: Request) -> dict[str, Any]:
     return {"ok": result.ok, "latency": result.latency, "message": result.message, "metrics": result.metrics}
 
 
-@protected.post("/monitors/{monitor_id}/token")
+@editor.post("/monitors/{monitor_id}/token")
 def regenerate_token(monitor_id: int, db: Database = Depends(get_db)) -> dict[str, Any]:
     monitor = load_monitor(db, monitor_id)
     if monitor["type"] != "push":
@@ -539,7 +559,7 @@ def regenerate_token(monitor_id: int, db: Database = Depends(get_db)) -> dict[st
     return serialize_monitor(db, load_monitor(db, monitor_id))
 
 
-@protected.get("/monitors/{monitor_id}/results")
+@viewer.get("/monitors/{monitor_id}/results")
 def monitor_results(
     monitor_id: int,
     range_: Literal["1h", "24h", "7d", "30d"] = Query("24h", alias="range"),
@@ -557,7 +577,7 @@ def monitor_results(
     return {"start": start, "end": end, "points": points, "metric_keys": metric_keys}
 
 
-@protected.get("/events")
+@viewer.get("/events")
 def list_events(
     monitor_id: int | None = None,
     limit: int = Query(50, ge=1, le=500),
@@ -646,12 +666,16 @@ async def push(token: str, request: Request) -> dict[str, Any]:
 # =========================================================================== channels
 
 
-@protected.get("/channels")
-def list_channels(db: Database = Depends(get_db)) -> list[dict[str, Any]]:
-    return [serialize_channel(c) for c in db.query("SELECT * FROM channels ORDER BY name COLLATE NOCASE")]
+@viewer.get("/channels")
+def list_channels(db: Database = Depends(get_db), principal: dict = Depends(authenticate)) -> list[dict[str, Any]]:
+    channels = [serialize_channel(c) for c in db.query("SELECT * FROM channels ORDER BY name COLLATE NOCASE")]
+    if not _can_edit(principal):  # channel settings contain tokens and passwords
+        for channel in channels:
+            channel["config"] = {}
+    return channels
 
 
-@protected.post("/channels", status_code=201)
+@editor.post("/channels", status_code=201)
 def create_channel(body: ChannelIn, db: Database = Depends(get_db)) -> dict[str, Any]:
     config = normalize_channel_config(body.type, body.config)
     channel_id = db.execute(
@@ -661,7 +685,7 @@ def create_channel(body: ChannelIn, db: Database = Depends(get_db)) -> dict[str,
     return serialize_channel(load_channel(db, channel_id))
 
 
-@protected.put("/channels/{channel_id}")
+@editor.put("/channels/{channel_id}")
 def update_channel(channel_id: int, body: ChannelIn, db: Database = Depends(get_db)) -> dict[str, Any]:
     load_channel(db, channel_id)
     config = normalize_channel_config(body.type, body.config)
@@ -672,14 +696,14 @@ def update_channel(channel_id: int, body: ChannelIn, db: Database = Depends(get_
     return serialize_channel(load_channel(db, channel_id))
 
 
-@protected.delete("/channels/{channel_id}", status_code=204)
+@editor.delete("/channels/{channel_id}", status_code=204)
 def delete_channel(channel_id: int, db: Database = Depends(get_db)) -> Response:
     load_channel(db, channel_id)
     db.execute("DELETE FROM channels WHERE id = ?", (channel_id,))
     return Response(status_code=204)
 
 
-@protected.post("/channels/{channel_id}/test")
+@editor.post("/channels/{channel_id}/test")
 async def test_channel(channel_id: int, request: Request) -> dict[str, Any]:
     db: Database = request.app.state.db
     channel = load_channel(db, channel_id)
@@ -694,20 +718,209 @@ async def test_channel(channel_id: int, request: Request) -> dict[str, Any]:
 
 
 @protected.get("/keys")
-def list_keys(users: UserStore = Depends(get_users)) -> list[dict[str, Any]]:
-    return users.list_api_keys()
+def list_keys(principal: dict = Depends(authenticate), users: UserStore = Depends(get_users)) -> list[dict[str, Any]]:
+    if has_permission(principal["permissions"], "users.manage"):
+        return users.list_api_keys()
+    return users.list_api_keys(principal["id"]) if principal["id"] else []
 
 
 @protected.post("/keys", status_code=201)
-def add_key(body: ApiKeyIn, users: UserStore = Depends(get_users)) -> dict[str, Any]:
-    key_id, key = create_api_key(users, body.name.strip())
+def add_key(
+    body: ApiKeyIn, principal: dict = Depends(authenticate), users: UserStore = Depends(get_users)
+) -> dict[str, Any]:
+    if principal["kind"] != "user":
+        raise HTTPException(403, "API-Keys können nur angemeldete Benutzer erzeugen")
+    key_id, key = create_api_key(users, body.name.strip(), principal["id"])
     return {"id": key_id, "name": body.name.strip(), "key": key}
 
 
 @protected.delete("/keys/{key_id}", status_code=204)
-def delete_key(key_id: int, users: UserStore = Depends(get_users)) -> Response:
-    if not users.delete_api_key(key_id):
+def delete_key(
+    key_id: int, principal: dict = Depends(authenticate), users: UserStore = Depends(get_users)
+) -> Response:
+    key = users.get_api_key(key_id)
+    if key is None:
         raise HTTPException(404, "API-Key nicht gefunden")
+    if key["user_id"] != principal["id"] and not has_permission(principal["permissions"], "users.manage"):
+        raise HTTPException(403, "Nur eigene API-Keys können widerrufen werden")
+    users.delete_api_key(key_id)
+    return Response(status_code=204)
+
+
+# =========================================================================== web push (app notifications)
+
+
+class PushSubscriptionIn(BaseModel):
+    endpoint: str = Field(max_length=2000)
+    keys: dict[str, str]
+
+
+class PushEndpointIn(BaseModel):
+    endpoint: str = Field(max_length=2000)
+
+
+@viewer.get("/webpush")
+def webpush_info(request: Request, principal: dict = Depends(authenticate)) -> dict[str, Any]:
+    webpush = request.app.state.webpush
+    return {
+        "public_key": webpush.public_key,
+        "endpoints": [s["endpoint"] for s in webpush.subscriptions(principal["id"])],
+    }
+
+
+@viewer.post("/webpush/subscriptions", status_code=201)
+def webpush_subscribe(body: PushSubscriptionIn, request: Request, principal: dict = Depends(authenticate)) -> dict[str, Any]:
+    if principal["kind"] != "user":
+        raise HTTPException(403, "Nur für angemeldete Benutzer")
+    try:
+        request.app.state.webpush.subscribe(
+            principal["id"], body.endpoint, body.keys.get("p256dh", ""), body.keys.get("auth", ""),
+            request.headers.get("user-agent", ""),
+        )
+    except ValueError as exc:
+        raise _bad(str(exc)) from None
+    return {"ok": True}
+
+
+@viewer.post("/webpush/unsubscribe")
+def webpush_unsubscribe(body: PushEndpointIn, request: Request) -> dict[str, Any]:
+    request.app.state.webpush.unsubscribe(body.endpoint)
+    return {"ok": True}
+
+
+@viewer.post("/webpush/test")
+async def webpush_test(request: Request, principal: dict = Depends(authenticate)) -> dict[str, Any]:
+    from .notifier import Notifier
+    from .webpush import push_message
+
+    delivered, errors = await request.app.state.webpush.send(push_message(Notifier.test_payload()), principal["id"])
+    if errors:
+        raise HTTPException(502, f"Versand fehlgeschlagen: {errors[0]}")
+    if delivered == 0:
+        raise HTTPException(409, "Auf keinem deiner Geräte sind Push-Benachrichtigungen aktiviert")
+    return {"ok": True, "delivered": delivered}
+
+
+# =========================================================================== users & rights
+
+
+class UserIn(BaseModel):
+    username: str = Field(min_length=1, max_length=64)
+    password: str | None = Field(None, max_length=256)
+    role_ids: list[int] = Field(default_factory=list)
+
+
+class RoleIn(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    description: str = Field("", max_length=255)
+    permissions: list[str] = Field(default_factory=list, max_length=100)
+
+
+def _check_roles(users: UserStore, role_ids: list[int]) -> list[int]:
+    known = {role["id"] for role in users.list_roles()}
+    unknown = sorted(set(role_ids) - known)
+    if unknown:
+        raise _bad(f"Unbekannte Rollen: {unknown}")
+    return sorted(set(role_ids))
+
+
+def _ensure_admin_left(users: UserStore) -> None:
+    """Called inside a transaction after a change: roll back if nobody could manage users anymore."""
+    if users.count_admins() == 0:
+        raise UserConflict("Mindestens ein Benutzer muss Benutzer und Rechte verwalten dürfen")
+
+
+@user_admin.get("/permissions")
+def list_permissions(users: UserStore = Depends(get_users)) -> list[dict[str, str]]:
+    known = dict(PERMISSIONS)
+    for role in users.list_roles():
+        for permission in role["permissions"]:
+            known.setdefault(permission, "")
+    return [{"permission": key, "description": value} for key, value in known.items()]
+
+
+@user_admin.get("/users")
+def list_users(users: UserStore = Depends(get_users)) -> list[dict[str, Any]]:
+    return users.list_users()
+
+
+@user_admin.post("/users", status_code=201)
+def create_user(body: UserIn, users: UserStore = Depends(get_users)) -> dict[str, Any]:
+    if not body.password or len(body.password) < 8:
+        raise _bad("Passwort muss mindestens 8 Zeichen haben")
+    _check_password_length(body.password)
+    role_ids = _check_roles(users, body.role_ids)
+    with users.transaction():
+        user_id = users.create_user(body.username.strip(), hash_password(body.password))
+        users.set_user_roles(user_id, role_ids)
+    return next(u for u in users.list_users() if u["id"] == user_id)
+
+
+@user_admin.put("/users/{user_id}")
+def update_user(user_id: int, body: UserIn, users: UserStore = Depends(get_users)) -> dict[str, Any]:
+    if users.get_user(user_id) is None:
+        raise HTTPException(404, "Benutzer nicht gefunden")
+    if body.password:
+        if len(body.password) < 8:
+            raise _bad("Passwort muss mindestens 8 Zeichen haben")
+        _check_password_length(body.password)
+    role_ids = _check_roles(users, body.role_ids)
+    with users.transaction():
+        users.rename_user(user_id, body.username.strip())
+        if body.password:
+            users.set_password(user_id, hash_password(body.password))
+        users.set_user_roles(user_id, role_ids)
+        _ensure_admin_left(users)
+    return next(u for u in users.list_users() if u["id"] == user_id)
+
+
+@user_admin.delete("/users/{user_id}", status_code=204)
+def delete_user(user_id: int, principal: dict = Depends(authenticate), users: UserStore = Depends(get_users)) -> Response:
+    if user_id == principal["id"]:
+        raise HTTPException(409, "Du kannst dich nicht selbst löschen")
+    with users.transaction():
+        if not users.delete_user(user_id):
+            raise HTTPException(404, "Benutzer nicht gefunden")
+        _ensure_admin_left(users)
+    return Response(status_code=204)
+
+
+@user_admin.get("/roles")
+def list_roles(users: UserStore = Depends(get_users)) -> list[dict[str, Any]]:
+    return users.list_roles()
+
+
+def _clean_permissions(permissions: list[str]) -> list[str]:
+    cleaned = sorted({p.strip() for p in permissions if p.strip()})
+    invalid = [p for p in cleaned if not is_valid_permission(p)]
+    if invalid:
+        raise _bad(f"Ungültige Berechtigungen: {', '.join(invalid)} (Format: app.aktion, app.* oder *)")
+    return cleaned
+
+
+@user_admin.post("/roles", status_code=201)
+def create_role(body: RoleIn, users: UserStore = Depends(get_users)) -> dict[str, Any]:
+    role_id = users.save_role(None, body.name.strip(), body.description.strip(), _clean_permissions(body.permissions))
+    return users.get_role(role_id)
+
+
+@user_admin.put("/roles/{role_id}")
+def update_role(role_id: int, body: RoleIn, users: UserStore = Depends(get_users)) -> dict[str, Any]:
+    if users.get_role(role_id) is None:
+        raise HTTPException(404, "Rolle nicht gefunden")
+    permissions = _clean_permissions(body.permissions)
+    with users.transaction():
+        users.save_role(role_id, body.name.strip(), body.description.strip(), permissions)
+        _ensure_admin_left(users)
+    return users.get_role(role_id)
+
+
+@user_admin.delete("/roles/{role_id}", status_code=204)
+def delete_role(role_id: int, users: UserStore = Depends(get_users)) -> Response:
+    with users.transaction():
+        if not users.delete_role(role_id):
+            raise HTTPException(404, "Rolle nicht gefunden")
+        _ensure_admin_left(users)
     return Response(status_code=204)
 
 
@@ -718,7 +931,7 @@ def _label(value: Any) -> str:
     return str(value).replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
 
-metrics_router = APIRouter(dependencies=[Depends(authenticate)])
+metrics_router = APIRouter(dependencies=[Depends(require("monitoring.view"))])
 
 
 @metrics_router.get("/metrics", response_class=PlainTextResponse)

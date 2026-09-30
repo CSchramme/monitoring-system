@@ -31,6 +31,40 @@ CREATE TABLE IF NOT EXISTS api_keys (
     last_used_at REAL
 );
 
+CREATE TABLE IF NOT EXISTS roles (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    description TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS role_permissions (
+    role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+    permission TEXT NOT NULL,
+    PRIMARY KEY (role_id, permission)
+);
+
+CREATE TABLE IF NOT EXISTS user_roles (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role_id INTEGER NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, role_id)
+);
+
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER,
+    endpoint TEXT NOT NULL UNIQUE,
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    user_agent TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    last_error TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS monitors (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
@@ -124,6 +158,12 @@ class Database:
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        columns = {row[1] for row in self._conn.execute("PRAGMA table_info(api_keys)")}
+        if "user_id" not in columns:
+            self._conn.execute("ALTER TABLE api_keys ADD COLUMN user_id INTEGER")
 
     def close(self) -> None:
         with self._lock:
@@ -150,6 +190,9 @@ class Database:
     @contextmanager
     def transaction(self) -> Iterator["Database"]:
         with self._lock:
+            if self._conn.in_transaction:  # nested: join the outer transaction
+                yield self
+                return
             self._conn.execute("BEGIN")
             try:
                 yield self

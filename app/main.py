@@ -9,13 +9,14 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import __version__
-from .api import metrics_router, protected, router
+from .api import editor, metrics_router, protected, router, user_admin, viewer
 from .auth import LoginThrottle
 from .config import Settings
 from .db import Database
 from .notifier import Notifier
 from .scheduler import Scheduler
-from .userstore import MariaDBUserStore, SqliteUserStore, UserStore, UserStoreError
+from .webpush import WebPush
+from .userstore import MariaDBUserStore, SqliteUserStore, UserConflict, UserStore, UserStoreError
 
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
@@ -49,6 +50,8 @@ def create_app(settings: Settings | None = None, start_scheduler: bool = True) -
     db = Database(settings.db_path)
     notifier = Notifier(db, settings.public_url)
     users = create_user_store(settings, db)
+    webpush = WebPush(db, settings.push_subject, users)
+    notifier.webpush = webpush
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -67,12 +70,17 @@ def create_app(settings: Settings | None = None, start_scheduler: bool = True) -
     app.state.db = db
     app.state.notifier = notifier
     app.state.users = users
+    app.state.webpush = webpush
     app.state.throttle = LoginThrottle()
 
     @app.exception_handler(UserStoreError)
     async def user_store_unavailable(request: Request, exc: UserStoreError):
         logging.getLogger("monitoring").error("User database error: %s", exc)
         return JSONResponse({"detail": f"Benutzer-Datenbank nicht erreichbar: {exc}"}, status_code=503)
+
+    @app.exception_handler(UserConflict)
+    async def user_conflict(request: Request, exc: UserConflict):
+        return JSONResponse({"detail": str(exc)}, status_code=409)
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next):
@@ -88,6 +96,9 @@ def create_app(settings: Settings | None = None, start_scheduler: bool = True) -
 
     app.include_router(router)
     app.include_router(protected)
+    app.include_router(viewer)
+    app.include_router(editor)
+    app.include_router(user_admin)
     app.include_router(metrics_router)
     app.mount("/agent", StaticFiles(directory=AGENT_DIR), name="agent")
     app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="ui")

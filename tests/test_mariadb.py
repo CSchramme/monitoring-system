@@ -30,7 +30,7 @@ def table():
     name = "test_users"
     conn = pymysql.connect(**_params(), autocommit=True)
     with conn.cursor() as cur:
-        for t in (name, "monitor_sessions", "monitor_api_keys"):
+        for t in (name, "roles", "role_permissions", "user_roles", "monitor_sessions", "monitor_api_keys"):
             cur.execute(f"DROP TABLE IF EXISTS `{t}`")
     yield name, conn
     conn.close()
@@ -64,6 +64,7 @@ def test_full_auth_flow(tmp_path, table):
 
 
 def test_existing_shared_table_with_php_hash(tmp_path, table):
+    """Users of other apps exist already: no setup, login works, but no rights until a role is granted."""
     name, conn = table
     with conn.cursor() as cur:
         cur.execute(
@@ -78,7 +79,31 @@ def test_existing_shared_table_with_php_hash(tmp_path, table):
     with TestClient(create_app(_settings(tmp_path, name), start_scheduler=False)) as client:
         assert client.get("/api/auth/status").json()["setup_required"] is False
         assert client.post("/api/auth/login", json={"username": "christoph", "password": "geheim123"}).status_code == 200
-        assert client.get("/api/auth/status").json()["user"]["name"] == "christoph"
+        user = client.get("/api/auth/status").json()["user"]
+        assert user["name"] == "christoph" and user["permissions"] == []
+        assert client.get("/api/monitors").status_code == 403
+
+    from app.cli import main as cli
+
+    p = _params()
+    env = {
+        "MONITOR_DATA_DIR": str(tmp_path), "MONITOR_USER_DB_HOST": p["host"], "MONITOR_USER_DB_PORT": str(p["port"]),
+        "MONITOR_USER_DB_USER": p["user"], "MONITOR_USER_DB_PASSWORD": p["password"],
+        "MONITOR_USER_DB_NAME": p["database"], "MONITOR_USER_DB_TABLE": name,
+    }
+    old = {k: os.environ.get(k) for k in env}
+    os.environ.update(env)
+    try:
+        assert cli(["grant-admin", "christoph"]) == 0
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    with TestClient(create_app(_settings(tmp_path, name), start_scheduler=False)) as client:
+        client.post("/api/auth/login", json={"username": "christoph", "password": "geheim123"})
+        assert client.get("/api/auth/status").json()["user"]["permissions"] == ["*"]
 
 
 def test_incompatible_table_is_rejected(table):

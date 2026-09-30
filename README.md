@@ -7,6 +7,8 @@ Telegram, ntfy, E-Mail, Slack oder einen eigenen Webhook.
 - **Ein Container**, eine SQLite-Datei, keine weiteren Dienste nötig
 - **Weboberfläche** (Deutsch, Hell/Dunkel, mobil nutzbar) mit Verlauf, Diagrammen und Statuswechseln
 - **REST-API** für alles, was die Oberfläche kann, und ein **Prometheus-Endpunkt** für Grafana
+- **Globale Benutzer- und Rechteverwaltung** mit Rollen, auf Wunsch in einer gemeinsamen MariaDB
+- **Handy-App (PWA)** für den Homebildschirm, mit **Push-Benachrichtigungen** bei Störungen
 
 ## Wie werden Systeme angebunden?
 
@@ -63,6 +65,7 @@ Voraussetzung ist Python 3.11 oder neuer. Für Ping-Prüfungen muss `ping` insta
 | `MONITOR_USER_DB_PORT` | `3306` | Port der Benutzer-Datenbank |
 | `MONITOR_USER_DB_NAME` / `_USER` / `_PASSWORD` | leer | Datenbankname und Zugangsdaten |
 | `MONITOR_USER_DB_TABLE` | `users` | Tabelle mit den Benutzerkonten |
+| `MONITOR_VAPID_SUBJECT` | `MONITOR_PUBLIC_URL` | Kontaktadresse für Push-Dienste (`mailto:…` oder `https://…`) |
 | `FORWARDED_ALLOW_IPS` | `127.0.0.1` | IP(s) des Reverse Proxys, dessen `X-Forwarded-For` vertraut wird (wichtig für die Login-Sperre nach Fehlversuchen) |
 
 ## Gemeinsame Benutzer-Datenbank (MariaDB, z. B. aus Plesk)
@@ -86,6 +89,57 @@ genutzt werden. Die Messdaten bleiben in der lokalen SQLite-Datei.
 **Plesk mit Docker:** Die MariaDB von Plesk lauscht normalerweise nur auf `127.0.0.1`. Deshalb nutzt
 die `docker-compose.yml` das Host-Netzwerk (`network_mode: host`) und `MONITOR_USER_DB_HOST=127.0.0.1`.
 Die Oberfläche ist dann direkt auf Port 8080 des Servers erreichbar.
+
+## Benutzer, Rollen und Rechte
+
+Unter **Benutzer & Rechte** verwalten Administratoren Konten und Rollen. Rechte hängen an Rollen,
+Rollen an Benutzern. Änderungen gelten sofort, auch für bestehende Anmeldungen und API-Keys.
+
+| Berechtigung | Erlaubt |
+|---|---|
+| `monitoring.view` | Monitoring ansehen (Übersicht, Verläufe, Prometheus) |
+| `monitoring.edit` | Monitore und Benachrichtigungen anlegen, ändern und löschen |
+| `users.manage` | Benutzer, Rollen und Rechte verwalten |
+| `*` | alles, in allen Anwendungen |
+
+Beim Start werden drei Rollen angelegt: **Administrator** (`*`), **Monitoring-Bearbeiter** und
+**Monitoring-Betrachter**. Das erste Konto aus der Ersteinrichtung wird Administrator.
+
+- **Global nutzbar:** Die Tabellen `roles`, `role_permissions` und `user_roles` liegen neben der
+  Benutzertabelle. Andere Anwendungen können dieselben Rollen nutzen und eigene Berechtigungen wie
+  `shop.orders.view` vergeben. `shop.*` erlaubt dabei alles in der Anwendung „shop“. Eine
+  Berechtigung prüfst du per SQL:
+  ```sql
+  SELECT 1 FROM user_roles ur JOIN role_permissions rp ON rp.role_id = ur.role_id
+  WHERE ur.user_id = ? AND rp.permission IN ('shop.orders.view', 'shop.*', '*');
+  ```
+- **Aussperr-Schutz:** Der letzte Benutzer mit Verwaltungsrechten kann weder gelöscht noch
+  herabgestuft werden.
+- **API-Keys** gehören einem Benutzer und haben genau dessen Rechte.
+- **Vorhandene Benutzer anderer Anwendungen** können sich sofort anmelden, haben aber keine Rechte,
+  bis ihnen eine Rolle zugewiesen wird. Gibt es noch keinen Administrator, geht das auf dem Server so:
+  ```bash
+  docker compose exec monitoring python -m app.cli grant-admin <benutzername>
+  docker compose exec monitoring python -m app.cli list-users
+  ```
+
+## Handy-App und Push-Benachrichtigungen
+
+Die Oberfläche ist eine installierbare Web-App (PWA). **Voraussetzung ist HTTPS**, in Plesk z. B.
+über eine Subdomain mit Let's Encrypt und Proxy auf Port 8080.
+
+1. **Auf den Homebildschirm legen:**
+   - Android (Chrome): *Anbindung & Einstellungen → App installieren* oder im Browsermenü „App installieren“.
+   - iPhone (Safari): *Teilen → Zum Home-Bildschirm*.
+2. **Push aktivieren:** In der App unter *Anbindung & Einstellungen → Push aktivieren*.
+   - Auf dem iPhone geht das ab iOS 16.4 und nur in der vom Homebildschirm geöffneten App.
+   - Für Bearbeiter wird dabei automatisch der Kanal **App-Push** angelegt und allen Monitoren
+     zugeordnet.
+3. Bei jedem Statuswechsel kommt eine Benachrichtigung, auch bei geschlossener App. Störungen
+   bleiben sichtbar, bis man sie antippt. Das Antippen öffnet den betroffenen Monitor.
+
+Push geht an alle Geräte von Benutzern mit `monitoring.view`. Die nötigen Schlüssel (VAPID)
+erzeugt der Server beim ersten Start selbst.
 
 ## Push-Schnittstelle
 
@@ -135,6 +189,7 @@ Mit *Fehlversuche bis Alarm* vermeidest du Fehlalarme durch einzelne Aussetzer.
 
 | Kanal | Benötigt |
 |---|---|
+| App-Push | nichts, Geräte aktivieren Push in der App |
 | Discord | Webhook-URL |
 | Telegram | Bot-Token (von @BotFather) und Chat-ID |
 | ntfy | Topic, optional eigener Server und Token |
@@ -177,8 +232,8 @@ scrape_configs:
 ```bash
 pip install -r requirements-dev.txt
 pytest
-# zusätzlich gegen eine Wegwerf-MariaDB:
-MONITOR_TEST_MARIADB="127.0.0.1:3306:user:passwort:datenbank" pytest tests/test_mariadb.py
+# alle Tests zusätzlich mit Benutzern/Rechten in einer Wegwerf-MariaDB:
+MONITOR_TEST_MARIADB="127.0.0.1:3306:user:passwort:datenbank" pytest
 ```
 
 Aufbau:
@@ -192,9 +247,11 @@ app/
   service.py     Statuslogik (Wiederholungen, Statuswechsel), Auswertungen
   notifier.py    Benachrichtigungskanäle
   auth.py        Passwörter, Sitzungen, API-Keys
-  userstore.py   Benutzer-Speicher: SQLite oder MariaDB
+  userstore.py   Benutzer, Rollen und Rechte: SQLite oder MariaDB
+  webpush.py     Web-Push an die installierte App
+  cli.py         Kommandozeile (Administrator ernennen, Benutzer auflisten)
   db.py          SQLite-Schema und Zugriff
-  static/        Weboberfläche (ohne Build-Schritt, keine externen Abhängigkeiten)
+  static/        Weboberfläche und PWA (Manifest, Service Worker, Icons), ohne Build-Schritt
 agent/           Agent-Skripte für Linux und Windows
 tests/           pytest-Suite
 ```

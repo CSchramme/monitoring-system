@@ -7,9 +7,9 @@ import time
 from collections import defaultdict, deque
 
 import bcrypt
-from fastapi import HTTPException, Request
+from fastapi import Depends, HTTPException, Request
 
-from .userstore import UserStore
+from .userstore import UserStore, has_permission
 
 SESSION_COOKIE = "monitor_session"
 API_KEY_PREFIX = "mon_"
@@ -53,9 +53,9 @@ def delete_session(users: UserStore, token: str) -> None:
     users.delete_session(token_hash(token))
 
 
-def create_api_key(users: UserStore, name: str) -> tuple[int, str]:
+def create_api_key(users: UserStore, name: str, user_id: int | None) -> tuple[int, str]:
     key = API_KEY_PREFIX + secrets.token_urlsafe(32)
-    return users.add_api_key(name, token_hash(key), key[:10]), key
+    return users.add_api_key(name, token_hash(key), key[:10], user_id), key
 
 
 def new_push_token() -> str:
@@ -70,15 +70,30 @@ def authenticate(request: Request) -> dict:
         row = users.find_api_key(token_hash(header[7:].strip()))
         if row:
             users.touch_api_key(row["id"], time.time())
-            return {"kind": "api_key", "id": row["id"], "name": row["name"]}
+            # Keys act with their owner's current rights; keys from before rights existed have no owner.
+            permissions = users.permissions_for(row["user_id"]) if row["user_id"] else frozenset({"*"})
+            return {"kind": "api_key", "id": row["user_id"], "key_id": row["id"], "name": row["name"],
+                    "permissions": permissions}
         raise HTTPException(401, "Ungültiger API-Key")
 
     token = request.cookies.get(SESSION_COOKIE)
     if token:
         row = users.session_user(token_hash(token), time.time())
         if row:
-            return {"kind": "user", "id": row["id"], "name": row["username"]}
+            return {"kind": "user", "id": row["id"], "name": row["username"],
+                    "permissions": users.permissions_for(row["id"])}
     raise HTTPException(401, "Nicht angemeldet")
+
+
+def require(permission: str):
+    """Dependency factory: the caller must hold `permission`."""
+
+    def dependency(principal: dict = Depends(authenticate)) -> dict:
+        if not has_permission(principal["permissions"], permission):
+            raise HTTPException(403, f"Keine Berechtigung ({permission})")
+        return principal
+
+    return dependency
 
 
 class LoginThrottle:

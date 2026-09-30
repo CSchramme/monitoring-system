@@ -3,3 +3,4 @@ uvicorn==0.54.0
 httpx==0.28.1
 bcrypt==5.0.0
 PyMySQL==1.2.3
+pywebpush==2.5.0
